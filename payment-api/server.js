@@ -30,8 +30,10 @@ CREATE TABLE IF NOT EXISTS venzy_payments (
   pix_copy_paste TEXT,
   pix_qr_base64 TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  approved_at TIMESTAMPTZ
+  approved_at TIMESTAMPTZ,
+  premium_granted_at TIMESTAMPTZ
 );
+ALTER TABLE venzy_payments ADD COLUMN IF NOT EXISTS premium_granted_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS venzy_entitlements (
   user_id TEXT PRIMARY KEY,
   premium_until TIMESTAMPTZ NOT NULL,
@@ -169,27 +171,20 @@ app.post("/api/webhooks/mercadopago", async (req, res) => {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      // Only one webhook can claim a payment for granting premium; retries are idempotent.
       const saved = await client.query(
-        "UPDATE venzy_payments SET status='approved', approved_at=COALESCE(approved_at,NOW()) WHERE mp_payment_id=$1 AND user_id=$2 AND amount_cents=$3 RETURNING user_id, approved_at",
+        "UPDATE venzy_payments SET status='approved', approved_at=COALESCE(approved_at,NOW()), premium_granted_at=NOW() WHERE mp_payment_id=$1 AND user_id=$2 AND amount_cents=$3 AND premium_granted_at IS NULL RETURNING user_id",
         [paymentId, String(payment.external_reference), PRICE_CENTS]
       );
       if (saved.rowCount === 1) {
-        const paymentRow = saved.rows[0];
-        // Idempotency: only the first transition to approved grants the 30 days.
-        const alreadyGranted = await client.query(
-          "SELECT 1 FROM venzy_entitlements WHERE user_id=$1 AND updated_at >= $2 LIMIT 1",
-          [paymentRow.user_id, paymentRow.approved_at]
+        await client.query(
+          `INSERT INTO venzy_entitlements(user_id,premium_until,updated_at)
+           VALUES($1,NOW() + INTERVAL '30 days',NOW())
+           ON CONFLICT(user_id) DO UPDATE SET
+           premium_until=GREATEST(venzy_entitlements.premium_until,NOW()) + INTERVAL '30 days',
+           updated_at=NOW()`,
+          [saved.rows[0].user_id]
         );
-        if (alreadyGranted.rowCount === 0) {
-          await client.query(
-            `INSERT INTO venzy_entitlements(user_id,premium_until,updated_at)
-             VALUES($1,NOW() + INTERVAL '30 days',NOW())
-             ON CONFLICT(user_id) DO UPDATE SET
-             premium_until=GREATEST(venzy_entitlements.premium_until,NOW()) + INTERVAL '30 days',
-             updated_at=NOW()`,
-            [paymentRow.user_id]
-          );
-        }
       }
       await client.query("COMMIT");
     } catch (error) {
